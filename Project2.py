@@ -119,19 +119,17 @@ DEFAULT_DATA = [
     ("โรงประลองวัสดุขั้นสูง(หลังอาคารเครื่องมือ 16)", 14.87414, 102.01426, 0.2),
     ("บริษัทก่อสร้างพัฒนาวัสดุขั้นสูง(หลังอาคารเครื่องมือ 16)", 14.87188, 102.01456, 0.3),
     ("บ้านพักซอยสุขวิถี 1 (ใช้ถังแบบมีล้อ)", 14.88649, 102.00676, 4.3)
-] # อาจารย์ย่อข้อมูลลงเล็กน้อยเพื่อให้รันบน Streamlit ได้เร็วขึ้นสำหรับการทดสอบ
+]
 
 # =====================================================================
-# 📡 ฟังก์ชันดึงข้อมูล OSRM (ใช้ Cache เพื่อไม่ให้โหลดใหม่ทุกครั้ง)
+# 📡 ฟังก์ชันดึงข้อมูล OSRM Distance Matrix (สำหรับใช้คำนวณหาคำตอบ)
 # =====================================================================
 @st.cache_data
 def get_distance_matrix(locations):
     N = len(locations)
     distance_matrix = np.zeros((N, N))
     CHUNK_SIZE = 50
-    
-    # OSRM ต้องการ (Lon, Lat)
-    coords = [(item[2], item[1]) for item in locations]
+    coords = [(item[2], item[1]) for item in locations] # OSRM รับพิกัดแบบ (Lon, Lat)
     
     for i in range(0, N, CHUNK_SIZE):
         for j in range(0, N, CHUNK_SIZE):
@@ -152,13 +150,37 @@ def get_distance_matrix(locations):
                 if data.get("code") == "Ok":
                     distance_matrix[i:i+num_src, j:j+num_dst] = np.array(data["distances"])
             except Exception as e:
-                st.error(f"OSRM API Error: {e}")
+                st.error(f"OSRM API Error (Matrix): {e}")
             time.sleep(0.5)
             
     return pd.DataFrame(distance_matrix) / 1000.0  # เมตร -> กิโลเมตร
 
 # =====================================================================
-# 🧠 Algorithms
+# 📡 ฟังก์ชันดึงพิกัดโครงสร้างเส้นทางจริงตามแนวถนน (OSRM Route Geometry)
+# =====================================================================
+def get_osrm_route_geometry(route_seq, coords, depot):
+    """ดึงพิกัดจุดเลี้ยวทั้งหมดตามเส้นทางถนนจริงจาก OSRM Route API เพื่อใช้วาดรูปโค้งตามถนน"""
+    full_route = [depot] + route_seq + [depot]
+    route_coords = [coords[n] for n in full_route]
+    
+    # แปลงโครงสร้างพิกัดให้อยู่ในรูปแบบของ Route API (lon,lat;lon,lat;...)
+    coords_string = ";".join([f"{lon},{lat}" for lon, lat in route_coords])
+    url = f"http://router.project-osrm.org/route/v1/driving/{coords_string}?overview=full&geometries=geojson"
+    
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if data.get("code") == "Ok":
+            # คืนค่าอาเรย์พิกัดย่อยๆ [lon, lat] ตลอดแนวเส้นทางถนนจริง
+            return data["routes"][0]["geometry"]["coordinates"]
+    except Exception as e:
+        st.warning(f"⚠️ ไม่สามารถดึงเส้นทางจริงจากแนวถนนได้เนื่องจากเครือข่ายขัดข้อง: {e}")
+        
+    # หากระบบ API โครงข่ายถนนขัดข้อง ให้ดึงเส้นตรงจุดเชื่อมเดิมเป็น Fallback ป้องกันโปรแกรมแครช
+    return route_coords
+
+# =====================================================================
+# 🧠 Optimization Engines (Algorithms)
 # =====================================================================
 def run_savings_algorithm(df_dist, demands, nodes, max_capacity):
     depot = nodes[0]
@@ -198,16 +220,14 @@ def run_sweep_algorithm(locations, demands, nodes, max_capacity):
     depot = nodes[0]
     depot_lat, depot_lon = locations[0][1], locations[0][2]
     
-    # คำนวณมุม (Angle) ของแต่ละจุดเทียบกับ Depot
     customer_angles = []
-    for i, item in enumerate(locations[1:]): # ข้าม Depot
+    for i, item in enumerate(locations[1:]):
         node_name = item[0]
         lat, lon = item[1], item[2]
         angle = math.degrees(math.atan2(lat - depot_lat, lon - depot_lon))
         if angle < 0: angle += 360
         customer_angles.append({"node": node_name, "angle": angle, "vol": demands[node_name]})
         
-    # เรียงลำดับตามมุม (Sweep)
     customer_angles.sort(key=lambda x: x['angle'])
     
     routes = []
@@ -232,7 +252,7 @@ def run_sweep_algorithm(locations, demands, nodes, max_capacity):
     return routes, route_vols
 
 # =====================================================================
-# 🎨 ฟังก์ชันวาดกราฟ (Visualization)
+# 🎨 ฟังก์ชันวาดกราฟ (Visualization ตามเส้นทางถนนจริง)
 # =====================================================================
 def plot_routes(routes, locations, nodes, title, grand_total_distance):
     depot = nodes[0]
@@ -242,67 +262,82 @@ def plot_routes(routes, locations, nodes, title, grand_total_distance):
     cmap = cm.get_cmap('tab20', len(routes))
 
     for trip_idx, route_seq in enumerate(routes):
-        full_route = [depot] + route_seq + [depot]
         route_color = cmap(trip_idx % 20)
 
-        x_vals = [coords[n][0] for n in full_route]
-        y_vals = [coords[n][1] for n in full_route]
+        # 1. เรียกพิกัดทางกายภาพที่ละเอียดตามแนวถนนจริงจาก OSRM Route API 
+        road_coords = get_osrm_route_geometry(route_seq, coords, depot)
+        x_vals = [pt[0] for pt in road_coords]
+        y_vals = [pt[1] for pt in road_coords]
         
-        ax.plot(x_vals, y_vals, marker='o', color=route_color, linewidth=2.5, markersize=5, alpha=0.8, label=f'Trip {trip_idx+1}')
+        # 2. พลอตเส้นทึบที่เลี้ยวตามโค้งของถนน (เอา marker='o' ออกจากส่วนนี้ เพื่อไม่ให้จุดย่อยของถนนแสดงผลเต็มแผนที่จนรก)
+        ax.plot(x_vals, y_vals, color=route_color, linewidth=2.5, alpha=0.8, label=f'Trip {trip_idx+1}')
 
-        for k in range(len(x_vals)-1):
+        # 3. ใส่ลูกศรกำกับทิศทางการวิ่งให้อยู่บนผิวถนน โดยสุ่มใส่ทิศทางทุกๆ 15 ช่วงพิกัดย่อยของถนน เพื่อให้แผนที่ดูสะอาดสะอ้าน
+        for k in range(0, len(x_vals) - 1, 15):
             ax.annotate('', xy=(x_vals[k+1], y_vals[k+1]), xytext=(x_vals[k], y_vals[k]),
                          arrowprops=dict(arrowstyle="->", color=route_color, lw=1.5, alpha=0.7))
+        
+        # หน่วงเวลาสั้นๆ เพื่อถนอมการเรียกใช้งานเซิร์ฟเวอร์สาธารณะของ OSRM
+        time.sleep(0.2)
 
+    # 4. พลอตจุดพิกัดสถานีจัดเก็บ (Customers) และคลังหลัก (Depot) ทับไว้ด้านบนสุดของแผนเส้นทาง
     all_x = [coords[n][0] for n in nodes[1:]]
     all_y = [coords[n][1] for n in nodes[1:]]
-    ax.scatter(all_x, all_y, color='dimgray', zorder=5, s=20)
-    ax.scatter(coords[depot][0], coords[depot][1], color='red', marker='*', s=300, zorder=10, label='Depot')
+    ax.scatter(all_x, all_y, color='dimgray', zorder=5, s=25)
+    ax.scatter(coords[depot][0], coords[depot][1], color='red', marker='*', s=350, zorder=10, label='Depot')
 
-    ax.set_title(f'{title}\nGrand Total Distance: {grand_total_distance:.2f} km', fontsize=16, fontweight='bold')
-    ax.set_xlabel('Longitude (X)', fontsize=12)
-    ax.set_ylabel('Latitude (Y)', fontsize=12)
+    # แสดงชื่อภาษาไทยกำกับแต่ละจุดจอดแบบย่อความสะอาดตา
+    for node, (x, y) in coords.items():
+        if node == depot:
+            ax.text(x, y + 0.0004, 'DEPOT (บ่อขยะ)', fontsize=10, fontweight='bold', color='red', ha='center')
+        else:
+            short_name = str(node).replace(' จุดที่ ', '-')
+            ax.text(x + 0.0001, y + 0.0001, short_name, fontsize=8, color='black', alpha=0.8)
+
+    ax.set_title(f'{title}\n[วาดตามโครงข่ายเส้นทางถนนจริงบนระบบ GIS]', fontsize=16, fontweight='bold')
+    ax.set_xlabel('Longitude (พิกัด X)', fontsize=12)
+    ax.set_ylabel('Latitude (พิกัด Y)', fontsize=12)
     ax.grid(True, linestyle=':', alpha=0.5)
-    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=10, title="Route Details")
+    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=10, title="ลำดับรอบวิ่ง (Trip No.)")
     
     return fig
 
 # =====================================================================
-# 🖥️ Streamlit UI
+# 🖥️ Streamlit Web Interface Configuration
 # =====================================================================
 st.set_page_config(page_title="Smart Waste Collection CVRP", layout="wide")
-st.title("🚛 Smart Waste Collection Routing System")
-st.markdown("ระบบวิเคราะห์และปรับปรุงเส้นทางเดินรถเก็บขยะ (CVRP) เพื่อลดต้นทุนและคาร์บอนฟุตพริ้นท์")
+st.title("🚛 Smart Waste Collection Routing System (GIS & Road Network Base)")
+st.markdown("ระบบวิเคราะห์และแสดงผลลัพธ์การปรับปรุงเส้นทางเดินรถเก็บขยะตามโครงข่ายถนนจริงเพื่อลดต้นทุนทางพลังงานและสิ่งแวดล้อม")
 
 with st.sidebar:
-    st.header("⚙️ System Configuration")
-    max_capacity = st.number_input("ความจุสูงสุดของรถ (ลบ.ม.)", min_value=1.0, value=4.5, step=0.5)
-    algorithm_choice = st.selectbox("เลือก Algorithm", ("Clarke-Wright Savings", "Sweep Algorithm"))
-    use_default = st.checkbox("ใช้ข้อมูลทดสอบ (Default Data)", value=True)
-    start_btn = st.button("🚀 Start Optimization")
+    st.header("⚙️ ปรับแต่งตัวแปรแบบจำลอง")
+    max_capacity = st.number_input("ความจุสูงสุดของรถบรรทุกขยะ (ลบ.ม.)", min_value=1.0, value=4.5, step=0.5)
+    algorithm_choice = st.selectbox("เลือก อัลกอริทึมคำนวณ", ("Clarke-Wright Savings", "Sweep Algorithm"))
+    use_default = st.checkbox("ใช้ฐานข้อมูลพิกัด มทส. (Default Survey Data)", value=True)
+    start_btn = st.button("🚀 เริ่มต้นกระบวนการประมวลผล")
 
 if start_btn:
     if use_default:
         data_to_use = DEFAULT_DATA
     else:
-        st.warning("⚠️ โหมดอัปโหลดไฟล์กำลังอยู่ในการพัฒนา กรุณาใช้ข้อมูลทดสอบไปก่อนครับ")
+        st.warning("⚠️ ระบบรับไฟล์ภายนอกภารกิจกำลังทดสอบ กรุณาใช้ข้อมูลภาคสนามมาตรฐานของ มทส. ก่อนครับ")
         st.stop()
         
     nodes = [item[0] for item in data_to_use]
     demands = {item[0]: item[3] for item in data_to_use}
     
-    with st.spinner("📡 กำลังดึงข้อมูลระยะทางจริงจาก OSRM API..."):
+    with st.spinner("📡 ขั้นตอนที่ 1/3: กำลังคำนวณระยะทางขับขี่จริงระหว่างคู่จุดจอดจาก OSRM API..."):
         df_dist = get_distance_matrix(data_to_use)
         df_dist.columns = nodes
         df_dist.index = nodes
 
-    with st.spinner(f"⚙️ กำลังประมวลผลด้วย {algorithm_choice}..."):
+    with st.spinner(f"⚙️ ขั้นตอนที่ 2/3: กำลังประมวลผลการจัดกลุ่มเส้นทางด้วย {algorithm_choice}..."):
         if algorithm_choice == "Clarke-Wright Savings":
             routes, route_vols = run_savings_algorithm(df_dist, demands, nodes, max_capacity)
         elif algorithm_choice == "Sweep Algorithm":
             routes, route_vols = run_sweep_algorithm(data_to_use, demands, nodes, max_capacity)
             
-        # คำนวณระยะทางรวมและ Carbon Footprint
+        # คำนวณรอยเท้าระยะทางและอัตราการปล่อยมลพิษคาร์บอนฟุตพริ้นท์
         grand_total_distance = 0.0
         grand_total_volume = sum(route_vols)
         
@@ -313,21 +348,22 @@ if start_btn:
                 dist += df_dist.loc[full_route[k], full_route[k+1]]
             grand_total_distance += dist
             
-        emission_factor = 0.3 # สมมติ 0.3 kgCO2/km
+        emission_factor = 0.3 # ค่ามาตรฐานจำลอง 0.3 kgCO2/km สำหรับรถบรรทุกดีเซลขนาดกลาง
         carbon_emitted = grand_total_distance * emission_factor
         
-        # แสดงผล
-        st.success("✅ จัดเส้นทางสำเร็จ!")
+        # แสดงผลแดชบอร์ดสรุปค่าทางสถิติ (KPIs)
+        st.success("✅ ออปติไมซ์คำตอบและออกแบบเส้นทางเสร็จสมบูรณ์!")
         col1, col2, col3 = st.columns(3)
-        col1.metric("ระยะทางรวม (Total Distance)", f"{grand_total_distance:.2f} km")
-        col2.metric("ปริมาณขยะรวม (Total Volume)", f"{grand_total_volume:.2f} m³")
-        col3.metric("คาร์บอนที่ปล่อย (Est. CO₂)", f"{carbon_emitted:.2f} kg", "- ลดลงจากแผนเดิม", delta_color="inverse")
+        col1.metric("ระยะทางรวมระบบขับขี่จริง (Total Driving Distance)", f"{grand_total_distance:.2f} กม.")
+        col2.metric("ปริมาตรขยะที่เก็บขนได้ (Total Volume Collected)", f"{grand_total_volume:.2f} ลบ.ม.")
+        col3.metric("คาร์บอนฟุตพริ้นท์การขนส่ง (Estimated CO₂)", f"{carbon_emitted:.2f} กิโลกรัม CO₂")
         
-        # แสดงแผนที่
-        fig = plot_routes(routes, data_to_use, nodes, f"Optimized Routes ({algorithm_choice})", grand_total_distance)
-        st.pyplot(fig)
+        # แสดงผลลัพธ์ภาพกราฟิกแผนที่โครงข่ายถนนจริง
+        with st.spinner("🗺️ ขั้นตอนที่ 3/3: กำลังเรนเดอร์ลายเส้นเลี้ยวตามพิกัดถนนจริงบนแผนที่..."):
+            fig = plot_routes(routes, data_to_use, nodes, f"แผนภาพจำลองเส้นทางจริงบนเครือข่ายถนน ({algorithm_choice})", grand_total_distance)
+            st.pyplot(fig)
         
-        # สรุปเส้นทาง
-        st.markdown("### 📋 สรุปเส้นทางเดินรถ")
+        # ตารางสรุปแผนงานเดินรถรายรอบ (Operational Dispatch Schedule)
+        st.markdown("### 📋 ตารางลำดับการปฏิบัติงานรายเที่ยวรถ (Trip Operational Schedule)")
         for i, r in enumerate(routes):
-            st.write(f"**Trip {i+1}** (ปริมาตร {route_vols[i]:.2f} m³): Depot -> {' -> '.join(r)} -> Depot")
+            st.info(f"🚚 **เที่ยววิ่งที่ {i+1}** (ปริมาตรขยะสะสมประจำรอบ: {route_vols[i]:.2f} ลบ.ม.): \n\n บ่อขยะ Depot ➡️ {' ➡️ '.join(r)} ➡️ บ่อขยะ Depot")
