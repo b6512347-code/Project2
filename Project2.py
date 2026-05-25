@@ -11,7 +11,7 @@ import os
 import matplotlib.font_manager as fm
 
 # =====================================================================
-# 🛠️ ตั้งค่าฟอนต์ภาษาไทยสำหรับ Matplotlib
+# 🛠️ 1. การตั้งค่าทรัพยากรและฟอนต์ภาษาไทย (Font Configuration)
 # =====================================================================
 @st.cache_resource
 def setup_thai_font():
@@ -26,7 +26,7 @@ def setup_thai_font():
 setup_thai_font()
 
 # =====================================================================
-# ⚙️ ข้อมูลนำเข้า (Default Data)
+# ⚙️ 2. ฐานข้อมูลตั้งต้น (Default Field Survey Data)
 # =====================================================================
 DEFAULT_DATA = [
     ("Depot โรงจัดการขยะ", 14.862939, 102.027903, 0),
@@ -122,14 +122,16 @@ DEFAULT_DATA = [
 ]
 
 # =====================================================================
-# 📡 ฟังก์ชันดึงข้อมูล OSRM Distance Matrix (สำหรับใช้คำนวณหาคำตอบ)
+# 📡 3. การเชื่อมต่อโครงข่ายทางภูมิศาสตร์ (OSRM API Integration)
 # =====================================================================
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def get_distance_matrix(locations):
+    """ฟังก์ชันสร้าง Distance Matrix จากระยะทางขับขี่จริงบนถนน"""
     N = len(locations)
     distance_matrix = np.zeros((N, N))
     CHUNK_SIZE = 50
-    coords = [(item[2], item[1]) for item in locations] # OSRM รับพิกัดแบบ (Lon, Lat)
+    # OSRM รับพิกัดแบบ (Longitude, Latitude)
+    coords = [(item[2], item[1]) for item in locations]
     
     for i in range(0, N, CHUNK_SIZE):
         for j in range(0, N, CHUNK_SIZE):
@@ -151,19 +153,15 @@ def get_distance_matrix(locations):
                     distance_matrix[i:i+num_src, j:j+num_dst] = np.array(data["distances"])
             except Exception as e:
                 st.error(f"OSRM API Error (Matrix): {e}")
-            time.sleep(0.5)
+            time.sleep(0.5) # ป้องกันการส่ง Request ถี่เกินไป
             
-    return pd.DataFrame(distance_matrix) / 1000.0  # เมตร -> กิโลเมตร
+    return pd.DataFrame(distance_matrix) / 1000.0  # แปลง เมตร เป็น กิโลเมตร
 
-# =====================================================================
-# 📡 ฟังก์ชันดึงพิกัดโครงสร้างเส้นทางจริงตามแนวถนน (OSRM Route Geometry)
-# =====================================================================
 def get_osrm_route_geometry(route_seq, coords, depot):
-    """ดึงพิกัดจุดเลี้ยวทั้งหมดตามเส้นทางถนนจริงจาก OSRM Route API เพื่อใช้วาดรูปโค้งตามถนน"""
+    """ดึงพิกัดจุดเลี้ยว (Shapepoints) ตามแนวถนนจริงจาก OSRM Route API"""
     full_route = [depot] + route_seq + [depot]
     route_coords = [coords[n] for n in full_route]
     
-    # แปลงโครงสร้างพิกัดให้อยู่ในรูปแบบของ Route API (lon,lat;lon,lat;...)
     coords_string = ";".join([f"{lon},{lat}" for lon, lat in route_coords])
     url = f"http://router.project-osrm.org/route/v1/driving/{coords_string}?overview=full&geometries=geojson"
     
@@ -171,18 +169,17 @@ def get_osrm_route_geometry(route_seq, coords, depot):
         response = requests.get(url)
         data = response.json()
         if data.get("code") == "Ok":
-            # คืนค่าอาเรย์พิกัดย่อยๆ [lon, lat] ตลอดแนวเส้นทางถนนจริง
             return data["routes"][0]["geometry"]["coordinates"]
     except Exception as e:
-        st.warning(f"⚠️ ไม่สามารถดึงเส้นทางจริงจากแนวถนนได้เนื่องจากเครือข่ายขัดข้อง: {e}")
+        st.warning(f"⚠️ ไม่สามารถดึงเส้นทางตามแนวถนนจริงได้: {e}")
         
-    # หากระบบ API โครงข่ายถนนขัดข้อง ให้ดึงเส้นตรงจุดเชื่อมเดิมเป็น Fallback ป้องกันโปรแกรมแครช
     return route_coords
 
 # =====================================================================
-# 🧠 Optimization Engines (Algorithms)
+# 🧠 4. อัลกอริทึมการจัดเส้นทาง (Optimization Engines)
 # =====================================================================
 def run_savings_algorithm(df_dist, demands, nodes, max_capacity):
+    """Clarke-Wright Savings Algorithm (Capacitated)"""
     depot = nodes[0]
     customers = nodes[1:]
     
@@ -217,6 +214,7 @@ def run_savings_algorithm(df_dist, demands, nodes, max_capacity):
     return routes, route_vols
 
 def run_sweep_algorithm(locations, demands, nodes, max_capacity):
+    """Sweep Algorithm (Angular Clustering)"""
     depot = nodes[0]
     depot_lat, depot_lon = locations[0][1], locations[0][2]
     
@@ -252,41 +250,39 @@ def run_sweep_algorithm(locations, demands, nodes, max_capacity):
     return routes, route_vols
 
 # =====================================================================
-# 🎨 ฟังก์ชันวาดกราฟ (Visualization ตามเส้นทางถนนจริง)
+# 🎨 5. โมดูลแสดงผลแผนที่ (Data Visualization Module)
 # =====================================================================
 def plot_routes(routes, locations, nodes, title, grand_total_distance):
     depot = nodes[0]
     coords = {item[0]: (item[2], item[1]) for item in locations} # (Lon, Lat)
     
     fig, ax = plt.subplots(figsize=(12, 8))
-    cmap = cm.get_cmap('tab20', len(routes))
+    cmap = cm.get_cmap('tab20', max(20, len(routes)))
 
     for trip_idx, route_seq in enumerate(routes):
         route_color = cmap(trip_idx % 20)
 
-        # 1. เรียกพิกัดทางกายภาพที่ละเอียดตามแนวถนนจริงจาก OSRM Route API 
+        # เรนเดอร์เส้นทางตามแนวถนนกายภาพจริง
         road_coords = get_osrm_route_geometry(route_seq, coords, depot)
         x_vals = [pt[0] for pt in road_coords]
         y_vals = [pt[1] for pt in road_coords]
         
-        # 2. พลอตเส้นทึบที่เลี้ยวตามโค้งของถนน (เอา marker='o' ออกจากส่วนนี้ เพื่อไม่ให้จุดย่อยของถนนแสดงผลเต็มแผนที่จนรก)
         ax.plot(x_vals, y_vals, color=route_color, linewidth=2.5, alpha=0.8, label=f'Trip {trip_idx+1}')
 
-        # 3. ใส่ลูกศรกำกับทิศทางการวิ่งให้อยู่บนผิวถนน โดยสุ่มใส่ทิศทางทุกๆ 15 ช่วงพิกัดย่อยของถนน เพื่อให้แผนที่ดูสะอาดสะอ้าน
+        # สุ่มใส่ลูกศรเพื่อบอกทิศทาง (ไม่ให้รกเกินไป)
         for k in range(0, len(x_vals) - 1, 15):
             ax.annotate('', xy=(x_vals[k+1], y_vals[k+1]), xytext=(x_vals[k], y_vals[k]),
                          arrowprops=dict(arrowstyle="->", color=route_color, lw=1.5, alpha=0.7))
         
-        # หน่วงเวลาสั้นๆ เพื่อถนอมการเรียกใช้งานเซิร์ฟเวอร์สาธารณะของ OSRM
         time.sleep(0.2)
 
-    # 4. พลอตจุดพิกัดสถานีจัดเก็บ (Customers) และคลังหลัก (Depot) ทับไว้ด้านบนสุดของแผนเส้นทาง
+    # พล็อตจุดทิ้งขยะและจุด Depot
     all_x = [coords[n][0] for n in nodes[1:]]
     all_y = [coords[n][1] for n in nodes[1:]]
     ax.scatter(all_x, all_y, color='dimgray', zorder=5, s=25)
     ax.scatter(coords[depot][0], coords[depot][1], color='red', marker='*', s=350, zorder=10, label='Depot')
 
-    # แสดงชื่อภาษาไทยกำกับแต่ละจุดจอดแบบย่อความสะอาดตา
+    # ใส่ป้ายกำกับจุด (Labeling)
     for node, (x, y) in coords.items():
         if node == depot:
             ax.text(x, y + 0.0004, 'DEPOT (บ่อขยะ)', fontsize=10, fontweight='bold', color='red', ha='center')
@@ -294,7 +290,7 @@ def plot_routes(routes, locations, nodes, title, grand_total_distance):
             short_name = str(node).replace(' จุดที่ ', '-')
             ax.text(x + 0.0001, y + 0.0001, short_name, fontsize=8, color='black', alpha=0.8)
 
-    ax.set_title(f'{title}\n[วาดตามโครงข่ายเส้นทางถนนจริงบนระบบ GIS]', fontsize=16, fontweight='bold')
+    ax.set_title(f'{title}\n[ระบบแสดงผลอิงตามโครงข่ายถนนจริงบนระบบ GIS]', fontsize=16, fontweight='bold')
     ax.set_xlabel('Longitude (พิกัด X)', fontsize=12)
     ax.set_ylabel('Latitude (พิกัด Y)', fontsize=12)
     ax.grid(True, linestyle=':', alpha=0.5)
@@ -303,31 +299,58 @@ def plot_routes(routes, locations, nodes, title, grand_total_distance):
     return fig
 
 # =====================================================================
-# 🖥️ Streamlit Web Interface Configuration
+# 🖥️ 6. หน้าจอผู้ใช้งาน (Streamlit UI - Dynamic Input Version)
 # =====================================================================
 st.set_page_config(page_title="Smart Waste Collection CVRP", layout="wide")
-st.title("🚛 Smart Waste Collection Routing System (GIS & Road Network Base)")
-st.markdown("ระบบวิเคราะห์และแสดงผลลัพธ์การปรับปรุงเส้นทางเดินรถเก็บขยะตามโครงข่ายถนนจริงเพื่อลดต้นทุนทางพลังงานและสิ่งแวดล้อม")
+st.title("🚛 Smart Waste Collection Routing System")
+st.markdown("ระบบวิเคราะห์และแสดงผลลัพธ์การจัดเส้นทางแบบปรับเปลี่ยนตัวแปรได้ (Dynamic VRP DSS) พร้อมโครงข่ายถนนจริง")
 
+# --- แถบเครื่องมือด้านข้าง ---
 with st.sidebar:
-    st.header("⚙️ ปรับแต่งตัวแปรแบบจำลอง")
-    max_capacity = st.number_input("ความจุสูงสุดของรถบรรทุกขยะ (ลบ.ม.)", min_value=1.0, value=4.5, step=0.5)
-    algorithm_choice = st.selectbox("เลือก อัลกอริทึมคำนวณ", ("Clarke-Wright Savings", "Sweep Algorithm"))
-    use_default = st.checkbox("ใช้ฐานข้อมูลพิกัด มทส. (Default Survey Data)", value=True)
-    start_btn = st.button("🚀 เริ่มต้นกระบวนการประมวลผล")
+    st.header("⚙️ 1. ปรับแต่งตัวแปรยานพาหนะ")
+    max_vehicles = st.number_input("จำนวนรถขยะที่มีในระบบ (คัน)", min_value=1, value=5, step=1)
+    max_capacity = st.number_input("ความจุสูงสุดของรถ (ลบ.ม. / คัน)", min_value=1.0, value=4.5, step=0.5)
+    
+    st.header("⚙️ 2. เลือกอัลกอริทึม")
+    algorithm_choice = st.selectbox("เทคนิคการจัดเส้นทาง", ("Clarke-Wright Savings", "Sweep Algorithm"))
+    
+    st.header("📂 3. นำเข้าข้อมูลภาคสนาม (Optional)")
+    uploaded_file = st.file_uploader("อัปโหลดไฟล์ Excel/CSV (พิกัดและ Demand)", type=["xlsx", "csv"])
+    st.info("💡 หากไม่อัปโหลด ระบบจะใช้ฐานข้อมูลจำลองของ มทส.")
+
+# --- ส่วนจัดการข้อมูลและแสดงผล ---
+st.subheader("📝 ตารางจัดการข้อมูลพิกัดและปริมาณขยะ (Data Editor)")
+st.markdown("นักศึกษาสามารถ **เพิ่มแถวใหม่ (Add Row)** เพื่อใส่พิกัดใหม่ หรือ **แก้ไขตัวเลข Demand** ในตารางด้านล่างได้โดยตรง")
+
+if uploaded_file is not None:
+    if uploaded_file.name.endswith('.csv'):
+        df_input = pd.read_csv(uploaded_file)
+    else:
+        df_input = pd.read_excel(uploaded_file)
+else:
+    df_input = pd.DataFrame(DEFAULT_DATA, columns=["Node_Name", "Latitude", "Longitude", "Demand"])
+
+# แสดงตารางให้ผู้ใช้โต้ตอบและแก้ไขข้อมูลได้
+edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=True)
+
+# ปุ่มดำเนินการ
+start_btn = st.button("🚀 ยืนยันข้อมูลและเริ่มการประมวลผล (Start Optimization)", type="primary")
 
 if start_btn:
-    if use_default:
-        data_to_use = DEFAULT_DATA
-    else:
-        st.warning("⚠️ ระบบรับไฟล์ภายนอกภารกิจกำลังทดสอบ กรุณาใช้ข้อมูลภาคสนามมาตรฐานของ มทส. ก่อนครับ")
-        st.stop()
-        
-    nodes = [item[0] for item in data_to_use]
-    demands = {item[0]: item[3] for item in data_to_use}
+    data_to_use = edited_df.values.tolist()
+    nodes = edited_df["Node_Name"].tolist()
+    demands = dict(zip(edited_df["Node_Name"], edited_df["Demand"]))
     
+    # Validation: ตรวจสอบไม่ให้ Demand จุดใดจุดหนึ่งเกินความจุรถ
+    max_single_demand = max(demands.values())
+    if max_single_demand > max_capacity:
+        st.error(f"❌ พบข้อผิดพลาดทางโลจิสติกส์: มีจุดเก็บขยะบางจุด (Demand = {max_single_demand}) ที่มีปริมาณเกินความจุของรถ ({max_capacity})")
+        st.stop()
+
+    osrm_input_format = [(row[0], row[1], row[2], row[3]) for row in data_to_use]
+
     with st.spinner("📡 ขั้นตอนที่ 1/3: กำลังคำนวณระยะทางขับขี่จริงระหว่างคู่จุดจอดจาก OSRM API..."):
-        df_dist = get_distance_matrix(data_to_use)
+        df_dist = get_distance_matrix(osrm_input_format)
         df_dist.columns = nodes
         df_dist.index = nodes
 
@@ -335,9 +358,13 @@ if start_btn:
         if algorithm_choice == "Clarke-Wright Savings":
             routes, route_vols = run_savings_algorithm(df_dist, demands, nodes, max_capacity)
         elif algorithm_choice == "Sweep Algorithm":
-            routes, route_vols = run_sweep_algorithm(data_to_use, demands, nodes, max_capacity)
+            routes, route_vols = run_sweep_algorithm(osrm_input_format, demands, nodes, max_capacity)
             
-        # คำนวณรอยเท้าระยะทางและอัตราการปล่อยมลพิษคาร์บอนฟุตพริ้นท์
+        total_trips_needed = len(routes)
+        if total_trips_needed > max_vehicles:
+            st.warning(f"⚠️ ข้อสังเกตเชิงปฏิบัติการ: ระบบต้องใช้รอบวิ่งทั้งหมด {total_trips_needed} รอบ ซึ่งเกินจำนวนยานพาหนะที่มี ({max_vehicles} คัน)")
+            
+        # คำนวณสมรรถนะการปฏิบัติงาน (KPIs)
         grand_total_distance = 0.0
         grand_total_volume = sum(route_vols)
         
@@ -348,22 +375,24 @@ if start_btn:
                 dist += df_dist.loc[full_route[k], full_route[k+1]]
             grand_total_distance += dist
             
-        emission_factor = 0.3 # ค่ามาตรฐานจำลอง 0.3 kgCO2/km สำหรับรถบรรทุกดีเซลขนาดกลาง
+        emission_factor = 0.3 # สัมประสิทธิ์การปล่อยก๊าซ CO2 สำหรับรถบรรทุกขยะขนาดกลาง
         carbon_emitted = grand_total_distance * emission_factor
         
-        # แสดงผลแดชบอร์ดสรุปค่าทางสถิติ (KPIs)
         st.success("✅ ออปติไมซ์คำตอบและออกแบบเส้นทางเสร็จสมบูรณ์!")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("ระยะทางรวมระบบขับขี่จริง (Total Driving Distance)", f"{grand_total_distance:.2f} กม.")
-        col2.metric("ปริมาตรขยะที่เก็บขนได้ (Total Volume Collected)", f"{grand_total_volume:.2f} ลบ.ม.")
-        col3.metric("คาร์บอนฟุตพริ้นท์การขนส่ง (Estimated CO₂)", f"{carbon_emitted:.2f} กิโลกรัม CO₂")
         
-        # แสดงผลลัพธ์ภาพกราฟิกแผนที่โครงข่ายถนนจริง
-        with st.spinner("🗺️ ขั้นตอนที่ 3/3: กำลังเรนเดอร์ลายเส้นเลี้ยวตามพิกัดถนนจริงบนแผนที่..."):
-            fig = plot_routes(routes, data_to_use, nodes, f"แผนภาพจำลองเส้นทางจริงบนเครือข่ายถนน ({algorithm_choice})", grand_total_distance)
+        # แสดงแดชบอร์ด
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("รอบวิ่งที่ต้องใช้ (Trips)", f"{total_trips_needed} เที่ยว")
+        col2.metric("ระยะทางขับขี่จริงรวม", f"{grand_total_distance:.2f} กม.")
+        col3.metric("ปริมาตรขยะที่เก็บขน", f"{grand_total_volume:.2f} ลบ.ม.")
+        col4.metric("คาร์บอนฟุตพริ้นท์ (CO₂)", f"{carbon_emitted:.2f} กก.")
+        
+        # เรนเดอร์กราฟิก
+        with st.spinner("🗺️ ขั้นตอนที่ 3/3: กำลังเรนเดอร์ลายเส้นตามพิกัดถนนจริงบนระบบสารสนเทศภูมิศาสตร์..."):
+            fig = plot_routes(routes, osrm_input_format, nodes, f"แผนภาพจำลองเส้นทางจริง ({algorithm_choice})", grand_total_distance)
             st.pyplot(fig)
         
-        # ตารางสรุปแผนงานเดินรถรายรอบ (Operational Dispatch Schedule)
-        st.markdown("### 📋 ตารางลำดับการปฏิบัติงานรายเที่ยวรถ (Trip Operational Schedule)")
+        # ตารางปฏิบัติงาน (Dispatch Schedule)
+        st.markdown("### 📋 ตารางลำดับการปฏิบัติงานรายเที่ยวรถ (Dispatch Schedule)")
         for i, r in enumerate(routes):
-            st.info(f"🚚 **เที่ยววิ่งที่ {i+1}** (ปริมาตรขยะสะสมประจำรอบ: {route_vols[i]:.2f} ลบ.ม.): \n\n บ่อขยะ Depot ➡️ {' ➡️ '.join(r)} ➡️ บ่อขยะ Depot")
+            st.info(f"🚚 **เที่ยววิ่งที่ {i+1}** (ปริมาตรสะสม: {route_vols[i]:.2f} / {max_capacity} ลบ.ม.): \n\n บ่อขยะ Depot ➡️ {' ➡️ '.join(r)} ➡️ บ่อขยะ Depot")
